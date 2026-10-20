@@ -1,0 +1,147 @@
+name: Agent client
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Server deployment is linux/amd64 only, so the unit job does not cross-platform test.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The repository root is the Go module, so no working-directory is needed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No third-party dependency without a license decision
+        # A GPLv3 client stays trivially compatible while go.mod has no requirements at all.
+        # Adding a dependency should therefore be a deliberate decision about its license,
+        # not an accident of `go get`.
+        run: |
+          if [ -s go.sum ]; then
+            printf 'go.sum exists: audit every requirement against GPL-3.0 compatibility\n'
+            exit 1
+          fi
+
+      - name: No deployment leftovers
+        run: sh ci/publicize.sh .
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          # Nothing to cache: this module has no requirements at all, so setup-go only prints a
+          # warning about the missing go.sum on every single run.
+          cache: false
+
+      # The cross-module suite lives in the backend repository, which clones this one
+      # and runs tests/agent-client-backend.test.mjs against a real backend.
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - run: go build ./cmd/emporetic-agent
+
+  release:
+    # A version tag is the release trigger: the same ci/build-client.sh the release machine runs
+    # by hand produces the packages, their digests and latest.json, and GitHub Releases becomes
+    # the place users download from. Manual dispatches still test the client but publish nothing.
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ github.ref_name }}
+      DIST_DIR: ${{ github.workspace }}/.dist
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tagged commit
+        # A tag push carries the annotated tag object's own SHA, which is not what GitHub wants to
+        # be told about where a release came from. Checkout lands on the tagged commit, so ask Git
+        # directly and hand that single answer to every later step.
+        id: commit
+        run: |
+          printf 'sha=%s\n' "$(git rev-parse --verify 'HEAD^{commit}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          # Same reason as above: there are no dependencies to restore from.
+          cache: false
+
+      - name: Build client packages
+        run: sh ci/build-client.sh
+
+      - name: Check the package layout
+        # Fail here rather than watching an asset glob quietly match nothing.
+        run: |
+          set -- ".dist/${VERSION}"/*.tar.gz
+          [ -f "$1" ] || { printf 'no packages under .dist/%s\n' "${VERSION}"; exit 1; }
+          if [ ! -f .dist/latest.json ]; then printf 'missing .dist/latest.json\n'; exit 1; fi
+          VERSION="${VERSION}" python3 - <<'PY'
+          import json, os
+          manifest = json.load(open('.dist/latest.json'))
+          assert manifest['version'] == os.environ['VERSION'], manifest['version']
+          assert manifest['assets'], 'latest.json lists no packages'
+          print('packages ready:', ', '.join(a['name'] for a in manifest['assets']))
+          PY
+
+      - name: Write the release notes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          version = os.environ["VERSION"]
+          manifest = json.load(open(".dist/latest.json"))
+          lines = [f'# emporetic-agent {version}', '', '| package | 平台 | sha256 | 大小 |',
+                   '| --- | --- | --- | --- |']
+          for asset in manifest['assets']:
+              digest = asset['sha256']
+              lines.append(f'| `{asset["name"]}` | {asset["os"]}/{asset["arch"]} | '
+                           f'{digest[:12]}… | {asset["size_bytes"]} B |')
+          lines += ['',
+                    '解包前核对 SHA-256，然后 `chmod +x` 即可使用；运行时依赖 Git，使用者不需要装 Go。',
+                    '包里除了二进制还带着给编程 Agent 的技能（`.agents/skills/emporetic-agent/SKILL.md`）'
+                    '和 Pi 与通用适配器（`examples/`），先让干活的那个 Agent 加载技能再配置执行命令。',
+                    '`latest.json` 作为同一个 release 的附件发布，后端据此提供版本清单。']
+          open('.dist/release-notes.md', 'w').write('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          PY
+
+      - name: Publish the release
+        # On an annotated tag push, github.sha is the tag object's SHA rather than a commit, and
+        # the release API wants a commit-ish. Ask Git for the tagged commit above and say so here.
+        # The version tag itself is already pushed by ci/publish-github.sh, which keeps this step
+        # from needing permission to create refs at all.
+        uses: softprops/action-gh-release@v3
+        with:
+          name: emporetic-agent ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ steps.commit.outputs.sha }}
+          body_path: .dist/release-notes.md
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            .dist/*/*.tar.gz
+            .dist/latest.json
+
+      - name: Show what was built
+        # Failure logs sit behind authentication, so leave the evidence in the run summary too.
+        if: failure()
+        run: |
+          printf '# nothing was published\n\n```\n'
+          ls -la .dist ".dist/$VERSION" 2>&1 || true
+          printf '\n%s\n```\n' "$(cat .dist/latest.json 2>/dev/null)" >> "$GITHUB_STEP_SUMMARY"
