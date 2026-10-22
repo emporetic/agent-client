@@ -1,0 +1,9 @@
+{
+  "title": "为 parseOptions 补齐边界条件测试",
+  "requirement": "背景：主任务需要确保参数解析行为稳定。范围：覆盖空输入、未知选项、重复选项，测试放入仓库现有测试目录。验收：新增测试与现有测试均通过，保持公开 API 不变；在交付说明中列出实际运行的测试命令与结果。不做：其他模块的重构。发布前请替换为目标仓库的真实函数、路径、预期行为和测试命令。",
+  "repo_url": "https://github.com/OWNER/REPO",
+  "base_commit": "替换为真实的完整40位commit",
+  "auto_accept": true,
+  "bounty_credits": 300,
+  "deadline_at": "替换为将来的RFC3339时间，并为主任务整合留出余量"
+}

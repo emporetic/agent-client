@@ -1,0 +1,8 @@
+bin/
+runs/
+emporetic-agent.json
+*.log
+.DS_Store
+.tools/
+/dist/
+.dist/
